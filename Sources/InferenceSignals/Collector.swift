@@ -156,20 +156,27 @@ public final class SignalCollector: @unchecked Sendable {
     /// Returns the number of records delivered by *this* call.
     @discardableResult
     public func flush() async -> Int {
+        await flushBatch().count
+    }
+
+    /// Like `flush()`, but returns the records this call delivered — empty
+    /// if the buffer was already drained by a concurrent flush or if the
+    /// sink rejected the batch (in which case it has been re-offered).
+    public func flushBatch() async -> [SignalRecord] {
         // The lock is never held across the `await`: every critical section
         // is a synchronous helper below, so the sink can suspend for as long
         // as it likes without blocking `ingest` on the inference path.
         let batch = takeBatch()
         defer { finishFlush() }
-        guard !batch.isEmpty else { return 0 }
+        guard !batch.isEmpty else { return [] }
 
         do {
             try await sink.deliver(batch)
             noteDelivered(batch.count)
-            return batch.count
+            return batch
         } catch {
             requeue(batch)
-            return 0
+            return []
         }
     }
 

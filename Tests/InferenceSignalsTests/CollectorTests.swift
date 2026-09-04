@@ -111,6 +111,21 @@ final class CollectorTests: XCTestCase {
         XCTAssertEqual(batches, 1)
     }
 
+    func testFlushBatchReturnsExactlyWhatWasDelivered() async throws {
+        let sink = InMemorySink()
+        let collector = try makeCollector(sink: sink, sampling: .keepEverything)
+        for i in 0..<5 { collector.ingest(Fixtures.record(request: "a\(i)", at: Int64(i))) }
+        let first = await collector.flushBatch()
+        XCTAssertEqual(first.map { $0.requestID?.rawValue }, ["a0", "a1", "a2", "a3", "a4"])
+        for i in 0..<2 { collector.ingest(Fixtures.record(request: "b\(i)", at: Int64(10 + i))) }
+        let second = await collector.flushBatch()
+        XCTAssertEqual(second.map { $0.requestID?.rawValue }, ["b0", "b1"], "the second batch, not the cumulative log")
+        let empty = await collector.flushBatch()
+        XCTAssertEqual(empty, [])
+        let total = await sink.delivered.count
+        XCTAssertEqual(total, 7)
+    }
+
     func testConcurrentFlushesDeliverEveryRecordExactlyOnce() async throws {
         let sink = GatedSink(gated: true)
         let collector = try makeCollector(sink: sink, capacity: 10_000, sampling: .keepEverything)

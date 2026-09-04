@@ -81,10 +81,18 @@ public enum RequestPhase: String, Sendable, Codable {
 /// point does not retroactively reassign the request: the planner profile
 /// that produced a slow request keeps the blame even if the session has
 /// moved on to executing.
+///
+/// The set of open requests is bounded by `maximumOpenRequests`. A caller
+/// that enqueues and then abandons a handle (a cancelled request whose
+/// `fail` never ran) would otherwise leak its `PromptShape` and loop window
+/// for the life of the session; instead, enqueueing past the cap terminates
+/// the *oldest* open request as `.cancelled`, with an error record, so
+/// nothing vanishes and nothing grows.
 public final class SessionTracer: @unchecked Sendable {
     public let sessionID: Identifier
     public let tier: ExecutionTier
     public let toolLoopPolicy: ToolLoopPolicy
+    public let maximumOpenRequests: Int
 
     private let clock: any MonotonicClock
     private let environment: any DeviceEnvelopeProviding
@@ -122,7 +130,8 @@ public final class SessionTracer: @unchecked Sendable {
                 environment: any DeviceEnvelopeProviding,
                 collector: SignalCollector,
                 tailPolicy: TailPolicy,
-                toolLoopPolicy: ToolLoopPolicy = .standard) {
+                toolLoopPolicy: ToolLoopPolicy = .standard,
+                maximumOpenRequests: Int = 64) {
         self.sessionID = sessionID
         self.profile = initialProfile
         self.tier = tier
@@ -131,6 +140,9 @@ public final class SessionTracer: @unchecked Sendable {
         self.collector = collector
         self.tailPolicy = tailPolicy
         self.toolLoopPolicy = toolLoopPolicy
+        // A non-positive cap is a caller bug; clamp to 1 rather than trap or
+        // silently allow unbounded growth.
+        self.maximumOpenRequests = max(1, maximumOpenRequests)
         self.token = SessionTracer.tokenSource.next()
     }
 
@@ -156,8 +168,13 @@ public final class SessionTracer: @unchecked Sendable {
         collector.ingest(record)
     }
 
+    /// Switches the profile for requests enqueued from now on. Ignored
+    /// before `start()` and after `end()`: a switch record with no session
+    /// to anchor it is exactly the orphan the sampling key is designed not
+    /// to ship.
     public func switchProfile(to newProfile: ProfileID) {
         lock.lock()
+        guard started, !ended else { lock.unlock(); return }
         let previous = profile
         profile = newProfile
         let record = makeRecord(requestID: nil, profile: newProfile, device: environment.current(),
@@ -188,11 +205,19 @@ public final class SessionTracer: @unchecked Sendable {
     // MARK: Request lifecycle
 
     /// Enqueues a request. Queue wait is measured from here to
-    /// `markRunning`. Throws if the session is not open.
+    /// `markRunning`. Throws if the session is not open. If
+    /// `maximumOpenRequests` requests are already open, the oldest is
+    /// terminated as `.cancelled` first.
     public func enqueue(requestID: Identifier, shape: PromptShape) throws -> RequestHandle {
-        lock.lock(); defer { lock.unlock() }
-        guard started else { throw TracerError.sessionNotStarted }
-        guard !ended else { throw TracerError.sessionAlreadyEnded }
+        lock.lock()
+        guard started else { lock.unlock(); throw TracerError.sessionNotStarted }
+        guard !ended else { lock.unlock(); throw TracerError.sessionAlreadyEnded }
+        var evicted: [SignalRecord] = []
+        while requests.count >= maximumOpenRequests, let oldest = requests.keys.min() {
+            if let record = terminate(serial: oldest, failure: .cancelled) {
+                evicted.append(record)
+            }
+        }
         let serial = nextSerial
         nextSerial &+= 1
         requests[serial] = Request(id: requestID,
@@ -202,7 +227,12 @@ public final class SessionTracer: @unchecked Sendable {
                                    enqueuedAt: clock.now(),
                                    loop: ToolLoopMonitor(policy: toolLoopPolicy))
         Saturating.increment(&requestCount)
-        collector.noteRequestStarted(profile: profile)
+        let attributedProfile = profile
+        lock.unlock()
+        // Lock order: the tracer never holds its own lock while calling the
+        // collector, which has a lock of its own.
+        for record in evicted { collector.ingest(record) }
+        collector.noteRequestStarted(profile: attributedProfile)
         return RequestHandle(tracerToken: token, serial: serial)
     }
 

@@ -223,8 +223,15 @@ public struct SignalRecord: Hashable, Sendable, Codable {
     }
 
     /// The identity sampling decisions are keyed on. Every record of one
-    /// request shares it, so a request is kept or dropped whole; session
-    /// lifecycle records key on the session instead.
+    /// request shares it, so a request is kept or dropped whole.
+    ///
+    /// Session lifecycle records (`sessionStarted`, `profileSwitched`,
+    /// `sessionEnded`) have no request and key on the session instead, which
+    /// means they share one deterministic coin for the session's whole life:
+    /// under a given envelope they are all kept or all dropped together. That
+    /// is deliberate — a profile switch with no session start to anchor it
+    /// is not useful to the fleet — and it is why the demo's "Last flush"
+    /// list shows no session rows once the device is hot.
     public var samplingKey: Digest {
         Digest(string: (requestID ?? sessionID).rawValue)
     }

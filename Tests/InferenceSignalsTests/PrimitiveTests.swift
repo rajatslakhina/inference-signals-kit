@@ -60,11 +60,14 @@ final class PrimitiveTests: XCTestCase {
         XCTAssertEqual(clock.now().nanoseconds, 1_000_010)
     }
 
-    func testSystemClockIsMonotonic() {
+    func testSystemClockAdvances() {
         let clock = SystemClock()
         let first = clock.now()
+        Thread.sleep(forTimeInterval: 0.002)
         let second = clock.now()
-        XCTAssertGreaterThanOrEqual(second, first)
+        // Strictly greater: a clock that returned a constant would fail.
+        XCTAssertGreaterThan(second, first)
+        XCTAssertGreaterThanOrEqual(second.elapsed(since: first).value, 1_000_000)
     }
 
     // MARK: Identifier

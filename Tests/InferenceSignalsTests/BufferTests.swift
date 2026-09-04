@@ -119,10 +119,15 @@ final class BufferTests: XCTestCase {
         }
         XCTAssertEqual(buffer.occupancy, 16)
         XCTAssertEqual(buffer.evictions[.nominal], 50_000 - 16)
+        // Measured *before* drain: drain empties the backing arrays, so a
+        // footprint read afterwards would be 0 for a leaking buffer too.
+        let footprint = buffer.storageFootprint
+        XCTAssertGreaterThanOrEqual(footprint, 16)
+        XCTAssertLessThan(footprint, 64, "dead prefix was not compacted")
         let ids = buffer.drain().compactMap { $0.requestID?.rawValue }
         XCTAssertEqual(ids.first, "r49984")
         XCTAssertEqual(ids.last, "r49999")
-        XCTAssertLessThan(buffer.storageFootprint, 64)
+        XCTAssertEqual(buffer.storageFootprint, 0)
     }
 
     // MARK: Audit — positive and negative controls

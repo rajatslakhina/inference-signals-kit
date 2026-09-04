@@ -194,6 +194,98 @@ final class TracerTests: XCTestCase {
                                 TracerError.unknownHandle)
     }
 
+    func testOpenRequestsAreBoundedAndTheOldestIsCancelledWithARecord() throws {
+        let h = try Harness()
+        let tracer = SessionTracer(sessionID: Fixtures.session, initialProfile: Fixtures.planner, tier: .onDevice,
+                                   clock: h.clock, environment: h.environment, collector: h.collector,
+                                   tailPolicy: TailPolicy(defaultBudget: .seconds(1)), maximumOpenRequests: 3)
+        tracer.start()
+        var handles: [RequestHandle] = []
+        for i in 0..<5 {
+            handles.append(try tracer.enqueue(requestID: .literal("r\(i)"), shape: Fixtures.shape()))
+        }
+        XCTAssertEqual(tracer.openRequests, 3, "never more than the cap")
+        let cancelled = h.buffered().filter {
+            if case .inferenceFailed(.cancelled, _, _) = $0.payload { return true } else { return false }
+        }
+        XCTAssertEqual(cancelled.map { $0.requestID?.rawValue }, ["r0", "r1"], "oldest first, each with a record")
+        // The evicted handles are dead; the survivors still work.
+        XCTAssertThrowsSpecific(try tracer.markRunning(handles[0]), TracerError.unknownHandle)
+        XCTAssertNoThrow(try tracer.markRunning(handles[4]))
+        XCTAssertEqual(SessionTracer(sessionID: Fixtures.session, initialProfile: Fixtures.planner, tier: .onDevice,
+                                     clock: h.clock, environment: h.environment, collector: h.collector,
+                                     tailPolicy: TailPolicy(defaultBudget: .seconds(1)),
+                                     maximumOpenRequests: 0).maximumOpenRequests, 1)
+    }
+
+    func testProfileSwitchIsIgnoredOutsideAnOpenSession() throws {
+        let h = try Harness()
+        h.tracer.switchProfile(to: Fixtures.executor)          // before start: no record
+        XCTAssertEqual(h.buffered(), [])
+        XCTAssertEqual(h.tracer.currentProfile, Fixtures.planner)
+        h.tracer.start()
+        h.tracer.switchProfile(to: Fixtures.executor)          // open: recorded
+        XCTAssertEqual(h.tracer.currentProfile, Fixtures.executor)
+        h.tracer.end()
+        h.tracer.switchProfile(to: Fixtures.planner)           // after end: no record
+        XCTAssertEqual(h.tracer.currentProfile, Fixtures.executor)
+        let switches = h.buffered().filter { if case .profileSwitched = $0.payload { return true } else { return false } }
+        XCTAssertEqual(switches.count, 1)
+    }
+
+    /// A sampler that calls back into the tracer from inside the collector.
+    /// If any tracer method called the collector while holding the tracer's
+    /// (non-recursive) lock, this would deadlock; the watchdog turns that
+    /// into a failure instead of a hung test run.
+    func testTracerNeverHoldsItsLockWhileCallingTheCollector() throws {
+        final class ReentrantSampler: SamplingDeciding, @unchecked Sendable {
+            let lock = NSLock()
+            var tracer: SessionTracer?
+            var observed = 0
+            func decide(_ record: SignalRecord) -> SamplingDecision {
+                lock.lock(); defer { lock.unlock() }
+                if let tracer {
+                    _ = tracer.currentProfile
+                    _ = tracer.openRequests
+                    observed += 1
+                }
+                return .keep(.withinRate(1))
+            }
+        }
+        let sampler = ReentrantSampler()
+        let collector = try SignalCollector(sink: InMemorySink(),
+                                            buffer: try PriorityRingBuffer(capacity: 100),
+                                            sampler: sampler,
+                                            tailPolicy: TailPolicy(defaultBudget: .seconds(1)))
+        let clock = ManualClock()
+        let tracer = SessionTracer(sessionID: Fixtures.session, initialProfile: Fixtures.planner, tier: .onDevice,
+                                   clock: clock, environment: StaticEnvelopeProvider(), collector: collector,
+                                   tailPolicy: TailPolicy(defaultBudget: .seconds(1)), maximumOpenRequests: 2)
+        sampler.lock.lock(); sampler.tracer = tracer; sampler.lock.unlock()
+
+        let finished = DispatchSemaphore(value: 0)
+        let worker = Thread {
+            defer { finished.signal() }
+            tracer.start()
+            tracer.switchProfile(to: Fixtures.executor)
+            guard let a = try? tracer.enqueue(requestID: .literal("a"), shape: Fixtures.shape()),
+                  let b = try? tracer.enqueue(requestID: .literal("b"), shape: Fixtures.shape()),
+                  let c = try? tracer.enqueue(requestID: .literal("c"), shape: Fixtures.shape()) // evicts a
+            else { return }
+            _ = a
+            try? tracer.markRunning(b)
+            _ = try? tracer.recordToolCall(b, ToolCallSignature(toolName: "t", argumentsDigest: Digest(string: "x")))
+            try? tracer.complete(b, outputTokens: 1)
+            try? tracer.fail(c, .guardrailRefusal)
+            tracer.end()
+        }
+        worker.start()
+        XCTAssertEqual(finished.wait(timeout: .now() + 5), .success, "tracer deadlocked calling the collector under its own lock")
+        sampler.lock.lock(); let observed = sampler.observed; sampler.lock.unlock()
+        // start, switch, a-cancelled, toolCall, complete, fail, end = 7 ingests, each re-entered the tracer.
+        XCTAssertEqual(observed, 7)
+    }
+
     func testHandlesAreNotTransferableBetweenTracers() throws {
         let a = try Harness()
         let b = try Harness()

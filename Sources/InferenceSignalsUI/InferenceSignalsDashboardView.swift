@@ -36,7 +36,10 @@ public struct DashboardConfiguration: Sendable {
 @Observable
 public final class DashboardModel {
     public private(set) var snapshot: SignalsSnapshot?
-    public private(set) var recentDeliveries: [SignalRecord] = []
+    /// Exactly the records delivered by the most recent successful flush,
+    /// newest first — not the sink's cumulative log.
+    public private(set) var lastFlush: [SignalRecord] = []
+    public private(set) var lastFlushCount: Int = 0
     public private(set) var lastOutcome: String = "Idle"
     public private(set) var setupError: String?
     public var thermal: ThermalState = .nominal { didSet { applyEnvelope() } }
@@ -46,12 +49,13 @@ public final class DashboardModel {
     private let configuration: DashboardConfiguration
     private let clock = ManualClock()
     private let environment = StaticEnvelopeProvider()
-    private let sink = InMemorySink(capacity: 2_000)
+    private let sink = OutageSink(capacity: 2_000)
     private var collector: SignalCollector?
     private var tracer: SessionTracer?
     private var executor: SimulatedExecutor
     private var profileCursor = 0
     private var driver: Task<Void, Never>?
+    private var flushTask: Task<Void, Never>?
 
     public init(configuration: DashboardConfiguration) {
         self.configuration = configuration
@@ -71,12 +75,30 @@ public final class DashboardModel {
                                        collector: collector,
                                        tailPolicy: configuration.tailPolicy,
                                        toolLoopPolicy: configuration.toolLoopPolicy)
-            tracer.start()
             self.tracer = tracer
             snapshot = collector.snapshot()
         } catch {
             setupError = String(describing: error)
         }
+    }
+
+    /// Opens the traced session. Called from the view's `.task`, not from
+    /// `init`, so constructing the model has no side effects — SwiftUI may
+    /// build a `@State` initial value more than once and keep only one.
+    /// Idempotent: `SessionTracer.start()` ignores repeated calls.
+    public func activate() {
+        tracer?.start()
+        snapshot = collector?.snapshot()
+    }
+
+    /// Stops the traffic driver and any in-flight flush. Called from the
+    /// view's `.onDisappear`; safe to call repeatedly.
+    public func pause() {
+        driver?.cancel()
+        driver = nil
+        flushTask?.cancel()
+        flushTask = nil
+        isRunning = false
     }
 
     private func applyEnvelope() {
@@ -87,9 +109,10 @@ public final class DashboardModel {
         snapshot = collector?.snapshot()
     }
 
-    /// Runs one simulated request on the next profile in rotation, then
-    /// switches the session to the profile after it (planner → executor →
-    /// reviewer → planner …).
+    /// Switches the session to the next profile in rotation (planner →
+    /// executor → reviewer → planner …) and runs one simulated request on
+    /// it. The switch happens *before* the request, so the request is
+    /// attributed to the profile that ran it.
     public func step() {
         guard let tracer, let collector, !configuration.profiles.isEmpty else { return }
         let index = profileCursor % configuration.profiles.count
@@ -108,25 +131,46 @@ public final class DashboardModel {
         snapshot = collector.snapshot()
     }
 
+    /// Flushes the collector and shows *that batch* — what the sink received
+    /// from this call, not its cumulative history. Flushes are not cancelled
+    /// or coalesced: each one that delivered something replaces the list, so
+    /// the "Delivered" counter and the list can never disagree. A flush that
+    /// raced another one and found the buffer empty leaves the previous
+    /// batch on screen.
     public func flush() {
         guard let collector else { return }
-        Task { @MainActor [weak self] in
+        flushTask = Task { @MainActor [weak self] in
+            let batch = await collector.flushBatch()
             guard let self else { return }
-            await collector.flush()
-            let delivered = await self.sink.delivered
-            self.recentDeliveries = Array(delivered.suffix(40).reversed())
+            if !batch.isEmpty {
+                self.lastFlushCount = batch.count
+                // The whole batch, newest first; it is bounded by the
+                // buffer's capacity, so this list is too.
+                self.lastFlush = Array(batch.reversed())
+            }
             self.snapshot = collector.snapshot()
         }
     }
 
+    /// Simulates the sink being unreachable. Deliveries fail, the collector
+    /// re-offers each batch through the buffer's class-aware bound, and once
+    /// the buffer is full of protected records the buffer starts *refusing*
+    /// the few nominal records the sampler still keeps.
+    public var sinkOutage: Bool = false {
+        didSet { let failing = sinkOutage; Task { await sink.setFailing(failing) } }
+    }
+
     /// Starts or pauses a driver that issues one request every 120 ms and
-    /// flushes every 20 requests.
+    /// flushes every 64 requests — long enough (each request emits two to
+    /// nine records) for a small buffer to fill and evict between flushes,
+    /// so the eviction counters move within seconds.
     public func toggleRunning() {
         if isRunning {
             driver?.cancel()
             driver = nil
             isRunning = false
         } else {
+            activate()
             isRunning = true
             driver = Task { @MainActor [weak self] in
                 var steps = 0
@@ -134,7 +178,7 @@ public final class DashboardModel {
                     guard let self else { return }
                     self.step()
                     steps = Saturating.add(steps, 1)
-                    if steps % 20 == 0 { self.flush() }
+                    if steps % 64 == 0 { self.flush() }
                     try? await Task.sleep(for: .milliseconds(120))
                 }
             }
@@ -149,6 +193,31 @@ public final class DashboardModel {
             return "\(profile.id): failed — \(failure.rawValue)"
         case .loopDetected(let verdict):
             return "\(profile.id): tool loop flagged — \(verdict)"
+        }
+    }
+}
+
+// MARK: - Sink
+
+/// An in-memory sink that can be told to fail, so the demo can show the
+/// collector's failed-delivery path (re-offer through the bounded buffer)
+/// without a network.
+actor OutageSink: SignalSink {
+    private(set) var delivered: [SignalRecord] = []
+    private var failing = false
+    let capacity: Int
+
+    init(capacity: Int) { self.capacity = max(1, capacity) }
+
+    struct Unreachable: Error {}
+
+    func setFailing(_ value: Bool) { failing = value }
+
+    func deliver(_ records: [SignalRecord]) async throws {
+        if failing { throw Unreachable() }
+        delivered.append(contentsOf: records)
+        if delivered.count > capacity {
+            delivered.removeFirst(delivered.count - capacity)
         }
     }
 }
@@ -180,6 +249,8 @@ public struct InferenceSignalsDashboardView: View {
                 deliveries
             }
             .navigationTitle("Inference Signals")
+            .task { model.activate() }
+            .onDisappear { model.pause() }
         }
     }
 
@@ -192,6 +263,7 @@ public struct InferenceSignalsDashboardView: View {
             }
             .pickerStyle(.segmented)
             Toggle("Low Power Mode", isOn: $model.lowPower)
+            Toggle("Sink outage (deliveries fail)", isOn: $model.sinkOutage)
             HStack {
                 Button(model.isRunning ? "Pause traffic" : "Run traffic") { model.toggleRunning() }
                     .buttonStyle(.borderedProminent)
@@ -240,11 +312,11 @@ public struct InferenceSignalsDashboardView: View {
     }
 
     private var deliveries: some View {
-        Section("Last flush (newest first)") {
-            if model.recentDeliveries.isEmpty {
+        Section("Last flush · \(model.lastFlushCount) record\(model.lastFlushCount == 1 ? "" : "s"), newest first") {
+            if model.lastFlush.isEmpty {
                 Text("Nothing delivered yet — tap Flush.").foregroundStyle(.secondary)
             }
-            ForEach(Array(model.recentDeliveries.enumerated()), id: \.offset) { _, record in
+            ForEach(Array(model.lastFlush.enumerated()), id: \.offset) { _, record in
                 HStack(alignment: .top) {
                     Text(record.recordClass.rawValue)
                         .font(.caption2.monospaced())

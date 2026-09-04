@@ -11,11 +11,19 @@ final class SchemaTests: XCTestCase {
         XCTAssertEqual(decoded.schemaVersion, SignalRecord.schemaVersion)
     }
 
-    func testEncodingIsDeterministic() throws {
+    func testEncodingIsDeterministicWithSortedKeys() throws {
         let record = Fixtures.record(request: "req-1", at: 5)
-        let encoder = JSONLinesEncoder()
-        XCTAssertEqual(try encoder.encode(record), try encoder.encode(record))
-        let lines = try encoder.encodeLines([record, record])
+        // Two independently constructed encoders must agree byte for byte,
+        // and the key order must be the sorted one — an encoder without
+        // `.sortedKeys` would emit declaration order (`schemaVersion` first)
+        // and fail the prefix assertion.
+        let a = try JSONLinesEncoder().encode(record)
+        let b = try JSONLinesEncoder().encode(record)
+        XCTAssertEqual(a, b)
+        let text = String(decoding: a, as: UTF8.self)
+        XCTAssertTrue(text.hasPrefix(#"{"device":{"energy":"unconstrained","thermal":"nominal"},"payload":"#), text)
+        XCTAssertTrue(text.hasSuffix(#""schemaVersion":1,"sessionID":"session-1","tier":"onDevice"}"#), text)
+        let lines = try JSONLinesEncoder().encodeLines([record, record])
         XCTAssertEqual(lines.filter { $0 == 0x0A }.count, 2)
     }
 

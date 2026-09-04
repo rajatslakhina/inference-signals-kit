@@ -103,6 +103,10 @@ public enum SamplingReason: Hashable, Sendable {
 /// Anything that decides whether a record survives. The library ships one
 /// implementation; the protocol exists so `SamplingAudit` can be pointed at
 /// a deliberately wrong one in tests.
+///
+/// `decide` is called by `SignalCollector.ingest` while the collector's
+/// lock is held. It must be a pure function of the record: an
+/// implementation that calls back into the collector would deadlock.
 public protocol SamplingDeciding: Sendable {
     func decide(_ record: SignalRecord) -> SamplingDecision
 }

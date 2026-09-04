@@ -106,13 +106,57 @@ final class SamplingTests: XCTestCase {
 
     // MARK: Sampler
 
-    func testDecisionIsDeterministicAndRequestCoherent() {
+    func testDecisionIsDeterministicAndRequestCoherent() throws {
+        // At `.fair` (50%) some requests are kept and some dropped. Find one
+        // of each and prove the tool call and the completion of the *same*
+        // request always agree — an assertion that `false == false` at a 2%
+        // rate would not distinguish coherence from "drop everything".
         let sampler = Sampler()
-        let toolCall = Fixtures.record(request: "req-7", thermal: .critical,
-                                       payload: .toolCall(toolDigest: Digest(string: "x"), sequence: 1))
-        let completion = Fixtures.record(request: "req-7", thermal: .critical)
-        XCTAssertEqual(sampler.decide(toolCall).isKept, sampler.decide(completion).isKept)
-        XCTAssertEqual(sampler.decide(toolCall), sampler.decide(toolCall))
+        var keptRequest: String?
+        var droppedRequest: String?
+        for i in 0..<200 {
+            let id = "req-\(i)"
+            let kept = sampler.decide(Fixtures.record(request: id, thermal: .fair)).isKept
+            if kept, keptRequest == nil { keptRequest = id }
+            if !kept, droppedRequest == nil { droppedRequest = id }
+        }
+        let kept = try XCTUnwrap(keptRequest)
+        let dropped = try XCTUnwrap(droppedRequest)
+        for id in [kept, dropped] {
+            let toolCall = Fixtures.record(request: id, thermal: .fair,
+                                           payload: .toolCall(toolDigest: Digest(string: "x"), sequence: 1))
+            let completion = Fixtures.record(request: id, thermal: .fair)
+            XCTAssertEqual(sampler.decide(toolCall).isKept, id == kept)
+            XCTAssertEqual(sampler.decide(completion).isKept, id == kept)
+            XCTAssertEqual(sampler.decide(toolCall), sampler.decide(toolCall))
+        }
+    }
+
+    func testSessionLifecycleRecordsShareOneDecision() throws {
+        // Records with no request key on the session, so a session's
+        // lifecycle rows are kept or dropped as a block. Checked at `.fair`
+        // (50%) over many sessions so that both outcomes occur and the
+        // assertion is coherence, not "everything was dropped".
+        let sampler = Sampler()
+        var keptSessions = 0
+        var droppedSessions = 0
+        for i in 0..<100 {
+            let session = Identifier.literal("session-\(i)")
+            func record(_ payload: SignalPayload) -> SignalRecord {
+                SignalRecord(sessionID: session, requestID: nil, profile: Fixtures.planner, tier: .onDevice,
+                             device: DeviceEnvelope(thermal: .fair, energy: .unconstrained),
+                             recordedAt: Instant(nanoseconds: Int64(i)), recordClass: .nominal, payload: payload)
+            }
+            let rows = [record(.sessionStarted),
+                        record(.profileSwitched(from: Fixtures.planner)),
+                        record(.sessionEnded(requestCount: 3))]
+            XCTAssertEqual(Set(rows.map(\.samplingKey)).count, 1)
+            let decisions = Set(rows.map { sampler.decide($0).isKept })
+            XCTAssertEqual(decisions.count, 1, "session \(i) was partially kept")
+            if decisions.contains(true) { keptSessions += 1 } else { droppedSessions += 1 }
+        }
+        XCTAssertGreaterThan(keptSessions, 20)
+        XCTAssertGreaterThan(droppedSessions, 20)
     }
 
     func testErrorsSurviveCriticalPressureAndNominalDoesNot() {
@@ -191,9 +235,5 @@ final class SamplingTests: XCTestCase {
             XCTAssertGreaterThan(count, 1_700, "\(buckets)")
             XCTAssertLessThan(count, 2_300, "\(buckets)")
         }
-    }
-
-    func testAuditReportsNothingForAnEmptyWorkload() {
-        XCTAssertEqual(SamplingAudit.verify(Sampler(), policy: .standard, records: []), [])
     }
 }

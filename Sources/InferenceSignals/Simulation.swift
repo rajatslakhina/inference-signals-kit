@@ -31,15 +31,26 @@ public struct SimulatedProfile: Hashable, Sendable {
                 loopRate: Double) {
         self.id = id
         self.contextWindowTokens = max(1, contextWindowTokens)
-        self.promptTokens = promptTokens
-        self.outputTokens = outputTokens
-        self.timeToFirstToken = timeToFirstToken
-        self.tokensPerSecond = tokensPerSecond
-        self.toolCalls = toolCalls
+        // Every range is normalised to non-negative bounds with
+        // lower ≤ upper, so a caller-supplied degenerate profile can never
+        // make the executor form an invalid range and trap.
+        self.promptTokens = SimulatedProfile.normalised(promptTokens)
+        self.outputTokens = SimulatedProfile.normalised(outputTokens)
+        self.timeToFirstToken = SimulatedProfile.normalised(timeToFirstToken)
+        self.tokensPerSecond = SimulatedProfile.normalised(tokensPerSecond)
+        self.toolCalls = SimulatedProfile.normalised(toolCalls)
         self.toolNames = toolNames
         self.failureRate = SimulatedProfile.unit(failureRate)
         self.tailRate = SimulatedProfile.unit(tailRate)
         self.loopRate = SimulatedProfile.unit(loopRate)
+    }
+
+    /// Non-negative, lower ≤ upper. `ClosedRange` already guarantees
+    /// lower ≤ upper at construction; this only lifts negative bounds to 0.
+    private static func normalised(_ range: ClosedRange<Int>) -> ClosedRange<Int> {
+        let lower = max(0, range.lowerBound)
+        let upper = max(lower, range.upperBound)
+        return lower...upper
     }
 
     /// Clamps to [0, 1]; NaN becomes 0.

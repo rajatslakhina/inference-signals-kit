@@ -102,4 +102,25 @@ final class SimulationTests: XCTestCase {
         XCTAssertEqual(clamped.tailRate, 0)
         XCTAssertEqual(clamped.loopRate, 0)
     }
+
+    func testDegenerateProfileRunsWithoutTrapping() throws {
+        // Negative ranges would make `rng.next(in: 0...promptTokens)` form an
+        // invalid range and trap; the initializer lifts them to zero.
+        let degenerate = SimulatedProfile(id: ProfileID(.literal("degenerate")), contextWindowTokens: -5,
+                                          promptTokens: -40 ... -10, outputTokens: -3 ... -1,
+                                          timeToFirstToken: -9 ... -1, tokensPerSecond: -2 ... -1,
+                                          toolCalls: -4 ... -2, toolNames: ["t"],
+                                          failureRate: 0, tailRate: 0, loopRate: 1)
+        XCTAssertEqual(degenerate.promptTokens, 0...0)
+        XCTAssertEqual(degenerate.toolCalls, 0...0)
+        XCTAssertEqual(degenerate.tokensPerSecond, 0...0)
+        var run = try Run(seed: 9)
+        run.tracer.switchProfile(to: degenerate.id)
+        for _ in 0..<50 {
+            let outcome = try run.executor.run(profile: degenerate, on: run.tracer, clock: run.clock)
+            if case .loopDetected = outcome { XCTFail("no tool calls can be drawn from 0...0") }
+        }
+        XCTAssertEqual(run.tracer.openRequests, 0)
+        XCTAssertEqual(run.collector.snapshot().profiles[degenerate.id]?.completions, 50)
+    }
 }
